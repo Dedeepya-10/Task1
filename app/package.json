@@ -1,0 +1,15 @@
+{
+  "name": "devops-task-app",
+  "version": "1.0.0",
+  "description": "Simple Express app for DevOps Round 1 task (Docker + ECR + Terraform)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
