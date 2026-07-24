@@ -1,0 +1,157 @@
+name: CI/CD - Test, Build, Push, Deploy
+
+# Run the pipeline on every push to main (full deploy) and on pull requests
+# targeting main (test-only, so bad code can't merge in the first place).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint + unit test the app. Runs on every push and PR. If this fails, the
+  # build/deploy jobs below never start - bad code never reaches ECR or EC2.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Lint & test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Run unit tests
+        run: npm test
+
+  # ---------------------------------------------------------------------------
+  # Build the Docker image and push it to ECR. Only runs on an actual push to
+  # main - pull requests get tested above but never build/push/deploy, since
+  # a PR branch shouldn't be able to touch production infrastructure.
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    name: Build & push to ECR
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ github.sha }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The EC2 instance is a standard x86_64 box, so the image always has to
+      # be built for linux/amd64 regardless of what architecture the runner
+      # (or a developer's laptop) happens to be - see the README for the
+      # arm64/amd64 issue this bit us with in Round 1.
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.ECR_REPOSITORY }}:latest
+            ${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+  # ---------------------------------------------------------------------------
+  # Deploy the newly-pushed image to EC2 over SSH. Only runs after a
+  # successful build/push on main.
+  #
+  # GitHub-hosted runners don't have a fixed IP range small enough to
+  # allowlist permanently, so instead of leaving port 22 open to the world,
+  # this job opens a security group rule for just this run's runner IP,
+  # deploys, and revokes that rule again in a cleanup step that runs even if
+  # the deploy fails (if: always()).
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to EC2
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Look up this runner's public IP
+        id: runner_ip
+        run: echo "ip=$(curl -s https://checkip.amazonaws.com)/32" >> "$GITHUB_OUTPUT"
+
+      - name: Temporarily allow SSH from this runner
+        run: |
+          aws ec2 authorize-security-group-ingress \
+            --group-id "${{ secrets.SECURITY_GROUP_ID }}" \
+            --protocol tcp --port 22 \
+            --cidr "${{ steps.runner_ip.outputs.ip }}"
+
+      - name: Pull new image and restart the container over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} \
+              | sudo docker login --username AWS --password-stdin "${{ env.ECR_REPOSITORY }}"
+            sudo docker pull "${{ env.ECR_REPOSITORY }}:${{ needs.build-and-push.outputs.image_tag }}"
+            sudo docker rm -f app || true
+            sudo docker run -d \
+              --name app \
+              --restart unless-stopped \
+              -p 80:3000 \
+              "${{ env.ECR_REPOSITORY }}:${{ needs.build-and-push.outputs.image_tag }}"
+            sleep 5
+            curl -f http://localhost/health
+
+      - name: Revoke temporary SSH access
+        if: always()
+        run: |
+          aws ec2 revoke-security-group-ingress \
+            --group-id "${{ secrets.SECURITY_GROUP_ID }}" \
+            --protocol tcp --port 22 \
+            --cidr "${{ steps.runner_ip.outputs.ip }}" || true
+
+      - name: Verify deployment from outside
+        run: |
+          sleep 5
+          curl -f http://${{ secrets.EC2_HOST }}/
+          curl -f http://${{ secrets.EC2_HOST }}/health

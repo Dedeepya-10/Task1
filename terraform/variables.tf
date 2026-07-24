@@ -18,12 +18,6 @@ variable "instance_type" {
   default     = "t3.micro"
 }
 
-variable "key_name" {
-  description = "Name of an existing EC2 key pair to attach for SSH access. Leave empty to skip attaching a key pair (you won't be able to SSH in)."
-  type        = string
-  default     = ""
-}
-
 variable "allowed_ssh_cidr" {
   description = "CIDR block allowed to SSH into the instance on port 22. Restrict this to your own IP (e.g. 1.2.3.4/32) instead of leaving it open to the world."
   type        = string

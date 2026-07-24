@@ -6,6 +6,10 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
   }
 }
 
@@ -96,6 +100,27 @@ resource "aws_security_group" "app" {
 }
 
 # ---------------------------------------------------------------------------
+# SSH key pair - generated and managed by Terraform (Round 2 requirement)
+# instead of a key created out-of-band with the AWS CLI. The private key is
+# exposed as a sensitive output so it can be copied into the EC2_SSH_KEY
+# GitHub Secret for the deploy workflow to use.
+# ---------------------------------------------------------------------------
+
+resource "tls_private_key" "ssh" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+resource "aws_key_pair" "generated" {
+  key_name   = "${var.project_name}-key"
+  public_key = tls_private_key.ssh.public_key_openssh
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
+# ---------------------------------------------------------------------------
 # IAM role so the EC2 instance can authenticate to ECR and pull the image
 # without embedding any credentials on the box.
 # ---------------------------------------------------------------------------
@@ -138,7 +163,7 @@ resource "aws_iam_instance_profile" "ec2_profile" {
 resource "aws_instance" "app_server" {
   ami                    = data.aws_ami.amazon_linux.id
   instance_type          = var.instance_type
-  key_name               = var.key_name != "" ? var.key_name : null
+  key_name               = aws_key_pair.generated.key_name
   subnet_id              = data.aws_subnets.default.ids[0]
   vpc_security_group_ids = [aws_security_group.app.id]
   iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name

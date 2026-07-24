@@ -1,7 +1,10 @@
-# DevOps Round 1 Task — Containerized Node.js App on AWS (Docker + ECR + Terraform)
+# DevOps Round 1 & 2 — Containerized Node.js App on AWS with CI/CD
 
 A simple Express app, containerized with Docker, pushed to AWS ECR, and deployed
-onto an EC2 instance provisioned entirely with Terraform.
+onto an EC2 instance provisioned entirely with Terraform (Round 1). Round 2 adds
+a GitHub Actions pipeline that tests, builds, pushes, and redeploys automatically
+on every push to `main` — see [CI/CD Pipeline (Round 2)](#cicd-pipeline-round-2)
+further down.
 
 ## Repository layout
 
@@ -9,15 +12,21 @@ onto an EC2 instance provisioned entirely with Terraform.
 .
 ├── app/                        # Node.js/Express application
 │   ├── package.json
-│   └── server.js
+│   ├── app.js                   # Express app (exported for tests)
+│   ├── server.js                 # Entry point - starts app.js on a port
+│   ├── app.test.js               # Jest/Supertest unit tests
+│   └── .eslintrc.json
 ├── Dockerfile                   # Multi-stage build, runs as non-root
 ├── .dockerignore
+├── .github/
+│   └── workflows/
+│       └── deploy.yml            # CI/CD: test -> build/push to ECR -> deploy to EC2
 ├── scripts/
-│   └── build-and-push.sh        # Builds the image and pushes it to ECR
+│   └── build-and-push.sh        # Builds the image and pushes it to ECR (manual/local use)
 ├── terraform/
-│   ├── main.tf                  # Security group, IAM role, EC2 instance
+│   ├── main.tf                  # Security group, IAM role, SSH key pair, EC2 instance
 │   ├── variables.tf             # Region / instance / app configuration
-│   ├── outputs.tf                # Public IP, DNS, app URL
+│   ├── outputs.tf                # Public IP, DNS, app URL, SSH key
 │   └── templates/
 │       └── user_data.sh.tpl     # EC2 bootstrap: installs Docker, pulls & runs the image
 └── README.md
@@ -119,12 +128,10 @@ terraform init
 
 terraform plan \
   -var="ecr_repository_url=<account-id>.dkr.ecr.us-east-1.amazonaws.com/devops-task-app" \
-  -var="key_name=<your-ec2-key-pair-name>" \
   -var="allowed_ssh_cidr=<your-ip>/32"
 
 terraform apply \
   -var="ecr_repository_url=<account-id>.dkr.ecr.us-east-1.amazonaws.com/devops-task-app" \
-  -var="key_name=<your-ec2-key-pair-name>" \
   -var="allowed_ssh_cidr=<your-ip>/32"
 ```
 
@@ -133,9 +140,13 @@ Or create a `terraform/terraform.tfvars` file instead of passing `-var` flags:
 ```hcl
 aws_region          = "us-east-1"
 ecr_repository_url  = "<account-id>.dkr.ecr.us-east-1.amazonaws.com/devops-task-app"
-key_name            = "<your-ec2-key-pair-name>"
 allowed_ssh_cidr    = "<your-ip>/32"
 ```
+
+> **Round 2 change:** there's no `key_name` variable anymore. Terraform now
+> generates the SSH key pair itself (`tls_private_key` + `aws_key_pair`) instead
+> of expecting one created out-of-band with the AWS CLI — see
+> [CI/CD Pipeline (Round 2)](#cicd-pipeline-round-2) for why.
 
 ### Variables (`variables.tf`)
 
@@ -143,7 +154,6 @@ allowed_ssh_cidr    = "<your-ip>/32"
 |---|---|---|
 | `aws_region` | `us-east-1` | Region to deploy into |
 | `instance_type` | `t3.micro` | Free-tier eligible instance size |
-| `key_name` | `""` | Existing EC2 key pair name for SSH (optional) |
 | `allowed_ssh_cidr` | `0.0.0.0/0` | CIDR allowed to SSH in — restrict to your IP |
 | `ecr_repository_url` | *required* | Full ECR repo URL to pull the image from |
 | `app_image_tag` | `latest` | Image tag to deploy |
@@ -154,7 +164,7 @@ allowed_ssh_cidr    = "<your-ip>/32"
 ### Outputs (`outputs.tf`)
 
 `instance_id`, `instance_public_ip`, `instance_public_dns`,
-`security_group_id`, `app_url`
+`security_group_id`, `app_url`, `ssh_key_name`, `ssh_private_key_pem` (sensitive)
 
 ### Terraform apply output
 
@@ -193,6 +203,48 @@ $ curl http://3.237.42.95/
 {"message":"Hello from the containerized DevOps task app!","hostname":"7d50f355e6fc","timestamp":"2026-07-23T19:17:36.223Z"}
 
 $ curl http://3.237.42.95/health
+{"status":"ok"}
+```
+
+**Round 2 re-apply** (after adding the Terraform-managed SSH key pair):
+
+```
+Plan: 7 to add, 0 to change, 0 to destroy.
+
+tls_private_key.ssh: Creating...
+tls_private_key.ssh: Creation complete after 1s
+aws_key_pair.generated: Creating...
+aws_iam_role.ec2_ecr_role: Creating...
+aws_security_group.app: Creating...
+aws_key_pair.generated: Creation complete after 2s [id=devops-task-key]
+aws_iam_role.ec2_ecr_role: Creation complete after 2s [id=devops-task-ec2-ecr-role]
+aws_iam_role_policy_attachment.ecr_read_only: Creating...
+aws_iam_instance_profile.ec2_profile: Creating...
+aws_iam_role_policy_attachment.ecr_read_only: Creation complete after 1s
+aws_security_group.app: Creation complete after 5s [id=sg-01294581e55648c7d]
+aws_iam_instance_profile.ec2_profile: Creation complete after 8s
+aws_instance.app_server: Creating...
+aws_instance.app_server: Still creating... [10s elapsed]
+aws_instance.app_server: Creation complete after 16s [id=i-09cb3e309adc27175]
+
+Apply complete! Resources: 7 added, 0 changed, 0 destroyed.
+
+Outputs:
+
+app_url = "http://3.236.126.113:80"
+instance_id = "i-09cb3e309adc27175"
+instance_public_dns = "ec2-3-236-126-113.compute-1.amazonaws.com"
+instance_public_ip = "3.236.126.113"
+security_group_id = "sg-01294581e55648c7d"
+ssh_key_name = "devops-task-key"
+ssh_private_key_pem = <sensitive>
+```
+
+```
+$ curl http://3.236.126.113/
+{"message":"Hello from the containerized DevOps task app!","hostname":"aa168a6b869d","timestamp":"2026-07-24T20:03:29.013Z"}
+
+$ curl http://3.236.126.113/health
 {"status":"ok"}
 ```
 
@@ -258,3 +310,155 @@ terraform destroy
   kept sending the new access key alongside the old, expired session token —
   producing `InvalidClientTokenId`. Fixed by removing the stale
   `aws_session_token` line, keeping only the new key pair.
+
+---
+
+## CI/CD Pipeline (Round 2)
+
+Round 1 was manual: build the image, push it to ECR, run Terraform, SSH in
+if something needed fixing. Round 2 automates that whole chain with GitHub
+Actions — every push to `main` tests, builds, pushes, and redeploys without
+anyone running a command by hand.
+
+### Pipeline flow
+
+```
+push to main / PR opened
+        │
+        ▼
+┌───────────────┐
+│   test job    │  ESLint + Jest, every push and PR
+└───────┬───────┘
+        │ (only continues past here on a push to main)
+        ▼
+┌────────────────────┐
+│  build-and-push job │  docker buildx build --platform linux/amd64
+│                      │  push to ECR tagged :latest and :<commit sha>
+└──────────┬───────────┘
+           ▼
+┌────────────────────────┐
+│      deploy job         │  1. open SG port 22 for this runner's IP only
+│                          │  2. SSH in, pull new image, restart container
+│                          │  3. curl /health on the box
+│                          │  4. revoke the SG rule (runs even on failure)
+│                          │  5. curl the public IP from outside to confirm
+└──────────────────────────┘
+```
+
+Pull requests only ever run the `test` job — a PR branch can never build,
+push, or touch the EC2 instance. Only a push that lands on `main` triggers
+`build-and-push` and `deploy`.
+
+### Why the SSH access is temporary, not a static IP allowlist
+
+GitHub-hosted runners don't come from a small, fixed IP range you could add
+to the security group once and forget about. Rather than opening port 22 to
+`0.0.0.0/0` permanently (or standing up a NAT/bastion just for this), the
+`deploy` job looks up its own public IP at the start of the run, adds a
+security-group rule for just that `/32`, deploys, and removes the rule again
+in a step marked `if: always()` — so it gets cleaned up even if the SSH step
+itself fails partway through. Port 22 is closed to the internet the rest of
+the time.
+
+### Setting up GitHub Secrets
+
+Go to the repo → **Settings → Secrets and variables → Actions → New repository secret**, and add each of these:
+
+| Secret | Value | Where to get it |
+|---|---|---|
+| `AWS_ACCESS_KEY_ID` | your IAM user's access key | IAM → Users → your user → Security credentials → Create access key |
+| `AWS_SECRET_ACCESS_KEY` | the matching secret key | shown once when the access key is created |
+| `AWS_REGION` | e.g. `us-east-1` | whichever region you deployed into |
+| `ECR_REPOSITORY` | e.g. `<account-id>.dkr.ecr.us-east-1.amazonaws.com/devops-task-app` | `terraform output` from Round 1, or the ECR console |
+| `SECURITY_GROUP_ID` | e.g. `sg-01294581e55648c7d` | `terraform output security_group_id` |
+| `EC2_HOST` | the instance's public IP | `terraform output instance_public_ip` |
+| `EC2_USER` | `ec2-user` | fixed for Amazon Linux 2023 |
+| `EC2_SSH_KEY` | the full private key, including the `-----BEGIN...` / `-----END...` lines | `terraform output -raw ssh_private_key_pem` |
+
+The IAM user behind `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` needs ECR
+push/pull access and `ec2:AuthorizeSecurityGroupIngress` /
+`RevokeSecurityGroupIngress` (both included in `AmazonEC2FullAccess` if
+you're using the same broad policy set from Round 1).
+
+Because Terraform now generates the SSH key pair itself instead of one
+created manually with the AWS CLI, `EC2_SSH_KEY` always matches whatever
+key the currently-deployed instance actually trusts — no more manually
+tracking a `.pem` file separately from the instance it belongs to.
+
+### Workflow steps explained
+
+- **`test`** — checks out the code, installs dependencies, runs `eslint .`
+  and `jest`. Runs on every push and every PR. If either fails, nothing
+  downstream runs.
+- **`build-and-push`** — configures AWS credentials, logs into ECR, and uses
+  `docker/build-push-action` with `platforms: linux/amd64` (see Round 1's
+  arm64/amd64 challenge below for why that flag is non-negotiable), pushing
+  two tags: `latest` and the commit SHA. The SHA tag means every deploy is
+  tied to an exact, traceable build instead of just overwriting `latest`
+  blind.
+- **`deploy`** — opens temporary SSH access, connects with
+  `appleboy/ssh-action`, and on the box: logs into ECR using the instance's
+  own IAM role (no AWS keys ever touch the EC2 box itself), pulls the
+  SHA-tagged image, force-removes the old `app` container, starts the new
+  one, and curls `/health` locally before closing the SSH session. It then
+  revokes the temporary SG rule and does one more external curl to confirm
+  the app is reachable from outside, not just from localhost on the box.
+
+### Testing strategy
+
+Went with **Jest + Supertest for a couple of route-level unit tests, plus
+ESLint for linting** — both of the "pick at least one" options, since
+neither takes much extra effort for an app this small and together they
+catch different problems: ESLint catches syntax/style issues before the app
+even runs, Jest/Supertest actually exercises the two routes (`/` and
+`/health`) and checks the response shape, which is what the Docker
+`HEALTHCHECK` and the deploy job's own health check depend on being correct.
+Didn't reach for a heavier test setup (e.g. spinning up the whole container
+in CI) since the app itself is intentionally minimal — the infrastructure is
+the actual point of this task, not the app logic.
+
+### Monitoring & viewing logs
+
+- **Workflow logs**: repo → **Actions** tab → click a run → expand any step.
+  Every `test`, `build-and-push`, and `deploy` step's full output is there.
+- **Container logs on EC2**:
+  ```bash
+  ssh -i <your-key>.pem ec2-user@<instance-ip>
+  sudo docker logs app --tail 100 -f
+  ```
+- **Container health status**:
+  ```bash
+  sudo docker inspect --format='{{.State.Health.Status}}' app
+  ```
+- **Instance boot/bootstrap log** (useful if the container never started at all):
+  ```bash
+  sudo tail -100 /var/log/cloud-init-output.log
+  ```
+
+### Troubleshooting common CI/CD failures
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `test` job fails | Lint or test failure | Read the step output — it names the exact rule/assertion that failed. Fix locally and re-push. |
+| `build-and-push` fails at ECR login | Wrong/expired `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, or wrong `AWS_REGION` | Double-check the secret values match a currently-active access key in the right region. |
+| `deploy` fails at "Temporarily allow SSH" | The IAM user lacks `ec2:AuthorizeSecurityGroupIngress`, or `SECURITY_GROUP_ID` is wrong/stale | Confirm the secret matches `terraform output security_group_id` for the *current* instance. |
+| SSH step times out or connection refused | `EC2_HOST` is stale (instance was recreated and got a new IP), or the instance isn't running | Re-check `terraform output instance_public_ip` and update the `EC2_HOST` secret. |
+| SSH step connects but auth fails | `EC2_SSH_KEY` doesn't match the key pair Terraform generated for the *current* instance | Re-run `terraform output -raw ssh_private_key_pem` and update the secret — this happens if the instance was replaced (e.g. after a `terraform apply` that recreates it) without updating the secret. |
+| Container starts but health check fails | App crashed on startup, or wrong port mapping | `sudo docker logs app` on the instance — this is exactly how the Round 1 `exec format error` (arm64/amd64 mismatch) was diagnosed. |
+| Deploy succeeds but app unreachable from outside | Security group doesn't allow port 80, or the instance's public IP changed | Confirm the SG still has the HTTP rule from Terraform, and that `EC2_HOST` matches the live IP. |
+
+### Challenges faced (Round 2)
+
+- Reused the exact `exec format error` lesson from Round 1 by making
+  `--platform linux/amd64` a permanent, non-optional part of the build step
+  rather than something that only lives in a shell script someone has to
+  remember to run correctly.
+- GitHub-hosted runner IPs aren't static, which rules out a simple
+  "allowlist this one IP forever" security group rule for SSH. Settled on
+  opening/closing the rule per-run instead of the two easier-but-worse
+  options: leaving port 22 open to the world, or standing up a bastion host
+  for a task this size.
+- Moved the SSH key from something created once by hand with the AWS CLI
+  (Round 1) to something Terraform generates and outputs — otherwise the
+  GitHub Secret and the actual running instance's trusted key can silently
+  drift apart the next time the instance gets recreated.
